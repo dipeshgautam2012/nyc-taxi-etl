@@ -1,0 +1,2 @@
+-- Gold star schema DDL and load logic live in src/taxi_etl/schema.py and transform.py.
+-- Tables: dim_date, dim_location, fact_rides (idempotent per year/month partition).

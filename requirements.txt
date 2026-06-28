@@ -1,0 +1,7 @@
+# Core
+pyarrow>=18.0.0
+
+# Optional warehouse backend (config [warehouse] backend = "duckdb")
+duckdb>=1.0.0
+
+# Optional later: streamlit (dashboard)

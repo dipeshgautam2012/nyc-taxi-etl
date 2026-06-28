@@ -1,0 +1,16 @@
+[data]
+bronze_dir = "data/bronze"
+logs_dir = "logs"
+
+[warehouse]
+backend = "sqlite"   # sqlite | duckdb
+path = "warehouse/taxi.db"
+
+[download]
+taxi_type = "yellow"
+base_url = "https://d37ci6vzurychx.cloudfront.net/trip-data"
+zone_lookup_url = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv"
+
+[validation]
+max_null_pickup_pct = 0.01
+min_rows_per_month = 1000

@@ -1,0 +1,3 @@
+-- Silver cleaning rules live in src/taxi_etl/transform.py (build_silver).
+-- Valid rows: non-null pickup/dropoff, PULocationID > 0, non-negative fare/distance,
+-- dropoff >= pickup. Invalid rows go to rejects_quarantine.
