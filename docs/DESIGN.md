@@ -1,6 +1,11 @@
 # NYC Taxi ETL — design
 
-Architecture for the batch ETL pipeline: medallion layers, linear orchestration, swappable warehouse, validation gates.
+Architecture for a **batch ETL** pipeline on NYC taxi data — **ETL** means Extract (download), Transform (clean and reshape), Load (write tables); **batch** means one year/month per run, not real-time.
+
+- **Medallion layers** — bronze (raw on disk) → silver (cleaned) → gold (analytics); bad rows go to **quarantine**.
+- **Warehouse** — the SQLite or DuckDB file holding silver, gold, and run-history tables.
+- **Orchestration** — what triggers the pipeline and runs steps in order (`run_partition()`).
+- **Validation gates** — whole-partition checks that **fail the run** if counts or quality thresholds break.
 
 Config: `config.toml` at project root. PRD: [`../prd_3.md`](../prd_3.md).
 
@@ -8,17 +13,17 @@ Config: `config.toml` at project root. PRD: [`../prd_3.md`](../prd_3.md).
 
 ## Rules
 
-- **One orchestrator:** `pipeline.run_partition()` in `src/taxi_etl/pipeline.py` — read top to bottom.
+- **One orchestrator:** `pipeline.run_partition()` in `src/taxi_etl/pipeline.py` — runs all steps top to bottom for one year/month **partition**.
 - **CLI entry:** `scripts/run_pipeline.py` loads config and calls `run_partition()`.
 - **Airflow optional:** `dags/` subprocesses the CLI — no ETL logic in Airflow, no Airflow imports in `taxi_etl`.
-- **Factory at one seam:** `make_warehouse()` — SQLite default, DuckDB optional. Dialect-specific SQL in `transform_sql.py`.
-- **Two kinds of quality control:** row cleaning during `build_silver` (`transform_sql.valid_where`) vs partition gates in `validate.py`.
+- **Factory at one seam:** `make_warehouse()` picks SQLite or DuckDB — the only swappable component. **Dialect** = that engine's SQL syntax, used in `transform_sql.py`.
+- **Two kinds of quality control:** per-row cleaning during `build_silver` (`transform_sql.valid_where`) vs **partition gates** in `validate.py` (whole month).
 
 ---
 
 ## System overview
 
-TLC Parquet + zone CSV → bronze on disk → ETL → warehouse tables. CLI triggers each run; optional Airflow subprocesses the same CLI.
+TLC **Parquet** (NYC's columnar trip files) + zone CSV → **bronze** on disk → ETL → **warehouse** tables. **CLI** (command-line script) triggers each run; optional Airflow subprocesses the same CLI.
 
 ![System overview](diagrams/system_overview.png)
 
@@ -26,15 +31,15 @@ TLC Parquet + zone CSV → bronze on disk → ETL → warehouse tables. CLI trig
 |-------|------|
 | **Bronze** | Immutable Parquet + ingest metadata on disk |
 | **ETL** | `run_partition()` — silver, validate, gold, validate, audit |
-| **Warehouse** | `silver_trips`, `fact_rides`, dims, `pipeline_runs` |
-| **CLI** | `scripts/run_pipeline.py` |
-| **Airflow** (optional) | Scheduler — BashOperator to CLI only |
+| **Warehouse** | Database file with `silver_trips`, `fact_rides`, dimension tables (`dim_*`), `pipeline_runs` |
+| **CLI** | `scripts/run_pipeline.py` — terminal entry point |
+| **Airflow** (optional) | Job scheduler; one DAG task shells out to the CLI |
 
 ---
 
 ## Orchestration
 
-There is a single ETL implementation. Airflow does not import `taxi_etl`.
+**Orchestration** = how a run starts and which code runs the steps. There is a single ETL implementation. Airflow does not import `taxi_etl`.
 
 ![Orchestration workflow](diagrams/orchestration_workflow.png)
 
@@ -53,9 +58,9 @@ Both paths call `pipeline.run_partition()` in one Python process.
 
 ### Airflow (optional)
 
-Skip this if you run `scripts/run_pipeline.py` yourself. Airflow only schedules the **same CLI** — no ETL code in `dags/`.
+Skip this if you run `scripts/run_pipeline.py` yourself. **Airflow** is a job scheduler with a web UI. A **DAG** is its workflow definition — here, `taxi_monthly_etl` with one task that runs the same CLI.
 
-**`dags/taxi_monthly_dag.py`** defines DAG `taxi_monthly_etl` with one `BashOperator` task that runs:
+**`dags/taxi_monthly_dag.py`** defines DAG `taxi_monthly_etl` with one task that shells out to:
 
 ```bash
 .venv/bin/python scripts/run_pipeline.py --year YYYY --month MM
@@ -113,7 +118,7 @@ This sets `AIRFLOW_HOME=./airflow` and runs `airflow standalone` (scheduler + we
 
 ## Pipeline workflow
 
-Linear module flow — no factory packages beyond `warehouses/`.
+Linear Python module flow for one **partition** (one `year` + `month`). No factory packages beyond `warehouses/`.
 
 ![Pipeline workflow](diagrams/pipeline_workflow.png)
 
@@ -123,8 +128,8 @@ Linear module flow — no factory packages beyond `warehouses/`.
 | 2 | Land bronze — raw trips + ingest metadata | Parquet on disk |
 | 3 | Silver — keep valid rows, quarantine bad rows | `transform.build_silver` → `silver_trips`, `rejects_quarantine` |
 | 4 | Validate silver — row count, null checks | `validate.py` — fail stops pipeline |
-| 5 | Gold — star schema (facts + date/location dims) | `transform.build_gold` → `fact_rides`, `dim_*` |
-| 6 | Validate gold — row count, location FKs | `validate.py` |
+| 5 | Gold — **star schema** (one fact table + dimension tables for date and location) | `transform.build_gold` → `fact_rides`, `dim_*` |
+| 6 | Validate gold — row count, location **foreign keys** (FKs) | `validate.py` |
 | 7 | Audit — log counts, status, validation results | `pipeline_runs` + `logs/` |
 
 | Module | Role |
@@ -151,7 +156,7 @@ Linear module flow — no factory packages beyond `warehouses/`.
 
 ## Data structure
 
-Medallion layers and gold star schema. Bronze is on disk; silver/gold live in the warehouse file.
+**Medallion architecture** — data moves through bronze → silver → gold, gaining quality at each stage. **Star schema** (gold) — `fact_rides` (measures per trip) joined to `dim_date` (when) and `dim_location` (where). Bronze is on disk; silver/gold live in the warehouse file.
 
 ![Data structure](diagrams/data_structure.png)
 
@@ -163,7 +168,7 @@ Medallion layers and gold star schema. Bronze is on disk; silver/gold live in th
 | **Quarantine** | Park bad rows | Rows that failed silver rules | `rejects_quarantine` |
 | **Run history** | Audit | Row counts, status, validation JSON | `pipeline_runs`, `logs/` |
 
-**Star schema (gold):** `fact_rides` (one row per trip) joined to `dim_date` (when) and `dim_location` (where).
+**Star schema (gold):** `fact_rides` (one row per trip, numeric measures) joined to `dim_date` (calendar/time attributes) and `dim_location` (borough/zone names) — the layout most BI tools and report SQL expect.
 
 ### Data inputs
 
@@ -186,7 +191,7 @@ Column definitions: [Technical reference](#technical-reference) below.
 
 ## Validation gates
 
-Row cleaning (per row, run continues) vs partition checks (whole month, fail stops run).
+**Validation gates** are whole-**partition** checks (one year/month) that stop or fail the run — separate from **per-row cleaning** during `build_silver` (bad rows quarantined; run continues).
 
 ![Validation gates](diagrams/validation_gates.png)
 
@@ -224,7 +229,7 @@ Failed row → `rejects_quarantine`. Run continues.
 | Check | Rule | Config key |
 |-------|------|------------|
 | `gold_min_rows` | `fact_rides` count for partition ≥ threshold | `min_rows_per_month` |
-| `gold_location_fks` | No orphan `pickup_location_id` / `dropoff_location_id` in `fact_rides` | (no config — must be 0) |
+| `gold_location_fks` | No **orphan foreign keys** — every `pickup_location_id` / `dropoff_location_id` in `fact_rides` must exist in `dim_location` | (no config — must be 0) |
 
 ```toml
 [validation]
@@ -240,14 +245,14 @@ Walkthrough with example rows: [README — Example walkthrough](../README.md#exa
 
 ## Warehouse backend
 
-Config picks SQLite or DuckDB. Two separate uses of the warehouse class:
+The **warehouse** is where silver and gold tables live — a single file, SQLite (`taxi.db`) or DuckDB (`taxi.duckdb`). Config picks the engine. Two separate uses of the warehouse class:
 
 ![Warehouse backend](diagrams/warehouse_backend.png)
 
 | Term | Where it lives | Meaning |
 |------|----------------|---------|
-| **backend** | `config.toml` → `AppConfig.warehouse_backend` | User choice: `sqlite` (default) or `duckdb` |
-| **dialect** | `warehouse.dialect` on each warehouse class | Same value as backend — tells `transform_sql.py` which SQL to emit |
+| **backend** | `config.toml` → `AppConfig.warehouse_backend` | Which database engine: `sqlite` (default) or `duckdb` |
+| **dialect** | `warehouse.dialect` on each warehouse class | That engine's SQL syntax — `transform_sql.py` emits different SQL per dialect |
 
 ```toml
 [warehouse]
@@ -350,7 +355,7 @@ Not used for silver cleaning — loaded when building gold.
 | `pickup_year`, `pickup_month`, `pickup_day`, `pickup_hour`, `pickup_dow` | **Derived** from pickup (`dow` 0=Sunday) |
 | `year`, `month` | Pipeline partition |
 | `run_id` | Pipeline run UUID |
-| `_source_file`, `_ingested_at` | Lineage from bronze |
+| `_source_file`, `_ingested_at` | **Lineage** — which source file and run produced this row |
 
 #### `rejects_quarantine`
 
@@ -369,7 +374,7 @@ Unknown zone IDs get placeholder rows so gold FK checks pass.
 
 | Column | Meaning |
 |--------|---------|
-| `date_key` | Surrogate key: `YYYYMMDD × 100 + hour` (e.g. `2024051514`) |
+| `date_key` | **Surrogate key** (generated ID, not from TLC): `YYYYMMDD × 100 + hour` (e.g. `2024051514`) |
 | `pickup_date` | Calendar date of pickup |
 | `year`, `month`, `day`, `hour`, `day_of_week` | Parts of pickup timestamp |
 
@@ -377,12 +382,12 @@ Unknown zone IDs get placeholder rows so gold FK checks pass.
 
 | Column | Meaning |
 |--------|---------|
-| `fact_ride_id` | Surrogate primary key |
-| `date_key` | FK → `dim_date` |
+| `fact_ride_id` | **Surrogate key** — auto-generated row ID |
+| `date_key` | **Foreign key** (FK) → `dim_date` |
 | `pickup_location_id`, `dropoff_location_id` | FK → `dim_location` |
 | `vendor_id`, `passenger_count`, `trip_distance` | Trip attributes |
 | `fare_amount`, `tip_amount`, `total_amount`, `trip_duration_minutes`, `payment_type` | Measures |
-| `year`, `month`, `run_id` | Partition and lineage |
+| `year`, `month`, `run_id` | **Partition** (year/month) and **lineage** (which pipeline run wrote the row) |
 
 #### `pipeline_runs` (audit)
 

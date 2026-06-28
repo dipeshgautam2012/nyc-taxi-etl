@@ -1,6 +1,10 @@
 # NYC Taxi ETL
 
-Batch pipeline that turns **raw NYC TLC trip files** into **clean, analytics-ready tables** using the **medallion architecture** (bronze → silver → gold).
+Downloads **NYC TLC** (Taxi & Limousine Commission) trip files and loads tables you can query in SQL.
+
+It is a **batch pipeline**: each run processes **one month** of data on demand, then exits — not real-time streaming.
+
+The flow is **ETL** (Extract → Transform → Load) using the **medallion architecture** — a pattern with three quality stages: **bronze** (raw copy on disk), **silver** (cleaned trips), **gold** (analytics-ready tables). Architecture detail: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ![System overview](docs/diagrams/system_overview.png)
 
@@ -17,7 +21,7 @@ Batch pipeline that turns **raw NYC TLC trip files** into **clean, analytics-rea
 
 From project root (`nyc-taxi-etl/`). Python 3.10+; network required on first download.
 
-**`download_data.py`** writes raw files under `data/bronze/`. **`run_pipeline.py`** does that too, then loads silver/gold tables into `warehouse/taxi.db` and a log under `logs/`.
+**`download_data.py`** writes raw files under `data/bronze/` (the medallion **bronze** layer). **`run_pipeline.py`** does that too, then loads **silver** and **gold** tables into the **warehouse** — a single SQLite or DuckDB database file (`warehouse/taxi.db`).
 
 ### Where outputs go
 
@@ -26,11 +30,11 @@ From project root (`nyc-taxi-etl/`). Python 3.10+; network required on first dow
 | **Raw trip file** — unchanged TLC Parquet for one month | `data/bronze/trips/year=YYYY/month=MM/yellow_tripdata_YYYY-MM.parquet` |
 | **Zone lookup** — borough/zone names for location IDs (downloaded once) | `data/bronze/reference/taxi_zone_lookup.csv` |
 | **Cleaned trips** (`silver_trips`) and **rejected rows** (`rejects_quarantine`) | `warehouse/taxi.db` |
-| **Analytics tables** — `fact_rides`, `dim_date`, `dim_location` | same file |
+| **Analytics tables** — `fact_rides`, `dim_date`, `dim_location` (**gold** layer; star schema) | same file |
 | **Run history** — row counts, status, validation results | `pipeline_runs` in same file |
 | **Text log** for this run | `logs/pipeline_*.log` |
 
-DuckDB: set `backend = "duckdb"` and `path = "warehouse/taxi.duckdb"` in `config.toml` — same table names, different file.
+DuckDB: an optional in-process SQL engine (alternative to SQLite). Set `backend = "duckdb"` and `path = "warehouse/taxi.duckdb"` in `config.toml` — same table names, different file.
 
 ### One-time setup
 
@@ -79,7 +83,7 @@ sqlite3 warehouse/taxi.db "SELECT validation_json FROM pipeline_runs ORDER BY st
 sqlite3 warehouse/taxi.db "SELECT COUNT(*) FROM fact_rides WHERE year=2024 AND month=5;"
 ```
 
-`validation_json` stores silver/gold gate results at the end of each run — for inspection only, not read back by the pipeline. Format: [`docs/DESIGN.md` — `validation_json`](docs/DESIGN.md#validation_json).
+`validation_json` stores **validation gate** results (did this month's data pass quality checks?) at the end of each run — for inspection only, not read back by the pipeline. Format: [`docs/DESIGN.md` — `validation_json`](docs/DESIGN.md#validation_json).
 
 ### Optional: DuckDB
 
@@ -91,7 +95,7 @@ path = "warehouse/taxi.duckdb"
 
 ### Optional: Airflow
 
-Not required for local runs — the CLI is enough. If you want a scheduler/UI:
+Not required for local runs — the CLI is enough. **Airflow** is an optional job scheduler with a web UI. A **DAG** (Directed Acyclic Graph) is its name for a workflow — here, one task that runs the same pipeline script.
 
 1. Install Airflow in a separate venv (Python 3.10–3.13)
 2. Start with `./scripts/start_airflow.sh`
@@ -103,14 +107,14 @@ Full install and usage: [`docs/DESIGN.md` — Airflow](docs/DESIGN.md#airflow-op
 
 ## Problem we solve
 
-NYC publishes **millions of taxi trips per month** as Parquet files. Useful, but not ready for reporting:
+NYC publishes **millions of taxi trips per month** as **Parquet** files (a compressed columnar format — efficient for large tables). Useful, but not ready for reporting:
 
 - **Dirty rows** — null pickup, negative fares, dropoff before pickup
 - **Wrong shape** — wide trip files, not organized for dashboards
-- **No quality gate** — bad data can reach analytics silently
+- **No quality gate** — no check that a whole month's data is sane before building analytics tables
 - **No run audit** — reruns need status, counts, and validation history
 
-This project saves **bronze** raw copies, **cleans** valid trips into **silver**, builds a **gold** star schema, **fails the run** when partition validation breaks, and records every run in `pipeline_runs` and `logs/`.
+This project saves **bronze** raw copies, **cleans** valid trips into **silver**, builds a **gold** **star schema** (one fact table `fact_rides` joined to dimension tables `dim_date` and `dim_location` — the usual layout for BI and SQL reports), **fails the run** when **partition** validation breaks (checks on the full year/month, not individual rows), and records every run in `pipeline_runs` and `logs/`.
 
 **Not in scope:** real-time streaming, a public API, or Airflow inside core ETL code.
 
@@ -122,7 +126,7 @@ Real **2024-05** runs: ~**3.72M** bronze → ~**3.66M** silver → ~**60k** quar
 
 Row-cleaning rules and partition gates: [`docs/DESIGN.md` — Validation gates](docs/DESIGN.md#validation-gates).
 
-### Step 1 — Bronze (raw input)
+### Step 1 — Bronze (raw input, no cleaning)
 
 File: `data/bronze/trips/year=2024/month=05/yellow_tripdata_2024-05.parquet`  
 Ingest copies Parquet and adds `_source_file`, `_ingested_at`, `_run_id`. **No cleaning.**
@@ -133,7 +137,9 @@ Ingest copies Parquet and adds `_source_file`, `_ingested_at`, `_run_id`. **No c
 | **B** | 2 | 2024-05-15 09:10:00 | 2024-05-15 09:25:00 | 2.1 | 162 | 230 | **-5.0** | **Dirty** — `fare_amount < 0` |
 | **C** | 1 | 2024-05-15 18:00:00 | **2024-05-15 17:45:00** | 1.0 | 161 | 229 | 12.0 | **Dirty** — dropoff before pickup |
 
-### Step 2 — Silver (clean vs quarantine)
+### Step 2 — Silver (clean trips vs quarantine)
+
+Rows that fail cleaning rules go to **quarantine** (`rejects_quarantine`) instead of silver.
 
 **Trip A → `silver_trips`:**
 
@@ -148,9 +154,9 @@ Ingest copies Parquet and adds `_source_file`, `_ingested_at`, `_run_id`. **No c
 | **B** | -5.0 | 09:25:00 | `invalid_pickup,dropoff,fare,distance,or_time_order` |
 | **C** | 12.0 | 17:45:00 (before pickup) | same label |
 
-**Validate silver** (full month): min row count, max null-pickup %. Fail → pipeline stops; gold not updated.
+**Validate silver** (checks the whole month — **partition** gate): min row count, max null-pickup %. Fail → pipeline stops; gold not updated.
 
-### Step 3 — Gold (star schema)
+### Step 3 — Gold (star schema for reporting)
 
 Zone names from `taxi_zone_lookup.csv`.
 
@@ -173,7 +179,7 @@ Zone names from `taxi_zone_lookup.csv`.
 |----------|-------------------|----------------------|-------------|----------------------|
 | 2024051514 | 161 → Midtown | 229 → LaGuardia | 14.5 | 16 |
 
-**Validate gold:** min row count, no orphan location FKs. Fail → run marked **failed**.
+**Validate gold:** min row count, no orphan **foreign keys** (FKs) — every `location_id` in `fact_rides` must exist in `dim_location`. Fail → run marked **failed**.
 
 ### Step 4 — Run audit
 
