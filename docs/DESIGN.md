@@ -53,23 +53,61 @@ Both paths call `pipeline.run_partition()` in one Python process.
 
 ### Airflow (optional)
 
-**`dags/`** holds [Apache Airflow](https://airflow.apache.org/) DAG definitions. In this repo: one file, `dags/taxi_monthly_dag.py`, defining DAG `taxi_monthly_etl` with **one task** that shells out to the same CLI. No ETL logic in the DAG.
+Skip this if you run `scripts/run_pipeline.py` yourself. Airflow only schedules the **same CLI** — no ETL code in `dags/`.
 
-Airflow is **not** in `requirements.txt`. Layout:
+**`dags/taxi_monthly_dag.py`** defines DAG `taxi_monthly_etl` with one `BashOperator` task that runs:
+
+```bash
+.venv/bin/python scripts/run_pipeline.py --year YYYY --month MM
+```
+
+Year/month come from trigger config (`dag_run.conf`), defaulting to 2024 and 5.
+
+Airflow is **not** in `requirements.txt`. It uses a **separate venv** from the ETL:
 
 | Path | Role |
 |------|------|
-| `.venv-airflow/` | Airflow install (Python 3.10–3.13) — gitignored |
-| `airflow/` | `AIRFLOW_HOME` — `airflow.db`, config, runtime logs — gitignored |
+| `.venv-airflow/` | Airflow install — gitignored |
+| `airflow/` | `AIRFLOW_HOME` — DB, config, logs — gitignored |
 | `dags/` | DAG files (tracked) |
-| `.venv/` | ETL env — the DAG subprocess uses this |
+| `.venv/` | ETL env — the DAG subprocess uses this Python |
 
-**Setup:**
+#### Install (one-time, from project root)
 
-1. Create `.venv-airflow` and `pip install apache-airflow==3.1.1` (see [Airflow install docs](https://airflow.apache.org/docs/apache-airflow/stable/installation/installing-from-pypi.html)).
-2. `export AIRFLOW_HOME="$(pwd)/airflow"` then `.venv-airflow/bin/airflow db migrate`.
-3. `./scripts/start_airflow.sh` (or `airflow standalone` with `AIRFLOW_HOME` set).
-4. Open the URL printed (default port **8080**). Unpause DAG `taxi_monthly_etl`, trigger manually. Optional config: `{"year": 2024, "month": 5}`.
+Use Python 3.10–3.13 for Airflow (3.1.1). Example with 3.13:
+
+```bash
+cd nyc-taxi-etl
+python3.13 -m venv .venv-airflow
+source .venv-airflow/bin/activate
+pip install "apache-airflow==3.1.1" \
+  --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.1.1/constraints-3.13.txt"
+export AIRFLOW_HOME="$(pwd)/airflow"
+airflow db migrate
+```
+
+Also ensure the ETL venv exists (`.venv` + `pip install -r requirements.txt`) — the DAG calls that Python.
+
+#### Run
+
+```bash
+./scripts/start_airflow.sh
+```
+
+This sets `AIRFLOW_HOME=./airflow` and runs `airflow standalone` (scheduler + web UI).
+
+#### Use
+
+1. Open the URL printed in the terminal (default **http://localhost:8080**).
+2. Log in with the admin user/password `standalone` prints on first start.
+3. In the UI, **unpause** DAG `taxi_monthly_etl`.
+4. **Trigger** manually. Optional run config JSON:
+
+```json
+{"year": 2024, "month": 5}
+```
+
+`schedule=None` in the DAG until you set a cron. The task log shows the same output as a terminal `run_pipeline.py` run.
 
 ---
 

@@ -91,7 +91,13 @@ path = "warehouse/taxi.duckdb"
 
 ### Optional: Airflow
 
-Not required for local runs. See [`docs/DESIGN.md` — Orchestration](docs/DESIGN.md#orchestration).
+Not required for local runs — the CLI is enough. If you want a scheduler/UI:
+
+1. Install Airflow in a separate venv (Python 3.10–3.13)
+2. Start with `./scripts/start_airflow.sh`
+3. Trigger DAG `taxi_monthly_etl` in the web UI (port **8080**)
+
+Full install and usage: [`docs/DESIGN.md` — Airflow](docs/DESIGN.md#airflow-optional).
 
 ---
 
