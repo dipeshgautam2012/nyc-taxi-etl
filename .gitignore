@@ -7,7 +7,6 @@ logs/
 __pycache__/
 *.pyc
 .env
-pyrightconfig.json
 airflow/
 
 # Local diagram-generation prompts (committed PNGs live in docs/diagrams/)
@@ -16,4 +15,5 @@ docs/diagrams/markdowns/
 # Local / IDE
 .DS_Store
 .vscode/
+pyrightconfig.json
 .pytest_cache/
