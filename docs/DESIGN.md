@@ -1,11 +1,24 @@
 # NYC Taxi ETL — design
 
-Architecture for a **batch ETL** pipeline on NYC taxi data — **ETL** means Extract (download), Transform (clean and reshape), Load (write tables); **batch** means one year/month per run, not real-time.
+**Problem:** NYC TLC trip files are dirty, poorly shaped, and unaudited — see [README — Problem we solve](../README.md#problem-we-solve).
 
+This document describes **how** the pipeline solves it:
+
+1. [System overview](#system-overview) — end-to-end picture
+2. [Data structure](#data-structure) — layers, tables, source files
+3. [Pipeline workflow](#pipeline-workflow) — step order and Python modules
+4. [Validation gates](#validation-gates) — per-row cleaning vs partition checks
+5. [Warehouse backend](#warehouse-backend) — SQLite / DuckDB storage
+6. [Orchestration](#orchestration) — how to start a run (CLI or Airflow)
+7. [Technical reference](#technical-reference) — column definitions
+
+**Batch ETL** — Extract (download), Transform (clean and reshape), Load (write tables); one year/month per run, not real-time.
+
+- **Partition** — one `year` + `month` slice; each pipeline run processes exactly one partition.
 - **Medallion layers** — bronze (raw on disk) → silver (cleaned) → gold (analytics); bad rows go to **quarantine**.
 - **Warehouse** — the SQLite or DuckDB file holding silver, gold, and run-history tables.
 - **Orchestration** — what triggers the pipeline and runs steps in order (`run_partition()`).
-- **Validation gates** — whole-partition checks that **fail the run** if counts or quality thresholds break.
+- **Validation gates** — partition-level checks that **fail the run** if counts or quality thresholds break.
 
 Config: `config.toml` at project root. PRD: [`../prd_3.md`](../prd_3.md).
 
@@ -13,17 +26,17 @@ Config: `config.toml` at project root. PRD: [`../prd_3.md`](../prd_3.md).
 
 ## Rules
 
-- **One orchestrator:** `pipeline.run_partition()` in `src/taxi_etl/pipeline.py` — runs all steps top to bottom for one year/month **partition**.
-- **CLI entry:** `scripts/run_pipeline.py` loads config and calls `run_partition()`.
+- **One orchestrator:** `pipeline.run_partition()` in `src/taxi_etl/pipeline.py` — runs all steps top to bottom for one partition.
+- **CLI entry:** `scripts/run_pipeline.py` — **CLI** (command-line script) that loads config and calls `run_partition()`.
 - **Airflow optional:** `dags/` subprocesses the CLI — no ETL logic in Airflow, no Airflow imports in `taxi_etl`.
-- **Factory at one seam:** `make_warehouse()` picks SQLite or DuckDB — the only swappable component. **Dialect** = that engine's SQL syntax, used in `transform_sql.py`.
-- **Two kinds of quality control:** per-row cleaning during `build_silver` (`transform_sql.valid_where`) vs **partition gates** in `validate.py` (whole month).
+- **Factory at one seam:** `make_warehouse()` picks SQLite or DuckDB — the only swappable component (**factory** = one function that chooses the implementation). **Dialect** = that engine's SQL syntax, used in `transform_sql.py`.
+- **Two kinds of quality control:** per-row cleaning during `build_silver` (bad rows → quarantine; run continues) vs **partition gates** in `validate.py` (whole month; fail stops or marks run failed).
 
 ---
 
 ## System overview
 
-TLC **Parquet** (NYC's columnar trip files) + zone CSV → **bronze** on disk → ETL → **warehouse** tables. **CLI** (command-line script) triggers each run; optional Airflow subprocesses the same CLI.
+End-to-end path for one partition: TLC **yellow taxi** trip **Parquet** files + a zone lookup CSV → **bronze** on disk → **ETL** in Python → **warehouse** tables. You start a run from the **CLI**; optional **Airflow** (job scheduler) can subprocess the same CLI.
 
 ![System overview](diagrams/system_overview.png)
 
@@ -33,13 +46,186 @@ TLC **Parquet** (NYC's columnar trip files) + zone CSV → **bronze** on disk �
 | **ETL** | `run_partition()` — silver, validate, gold, validate, audit |
 | **Warehouse** | Database file with `silver_trips`, `fact_rides`, dimension tables (`dim_*`), `pipeline_runs` |
 | **CLI** | `scripts/run_pipeline.py` — terminal entry point |
-| **Airflow** (optional) | Job scheduler; one DAG task shells out to the CLI |
+| **Airflow** (optional) | Job scheduler; **DAG** (workflow definition) with one task that shells out to the CLI |
+
+---
+
+## Data structure
+
+Where data lives and how quality increases by layer. **Medallion architecture** — bronze → silver → gold.
+
+**Star schema** (gold only) — a common analytics layout: one **fact** table (`fact_rides`: trip measures, one row per trip) linked to **dimension** tables (`dim_date`: time attributes; `dim_location`: place names). Reports and BI tools query by joining fact → dimensions. Bronze is files on disk; silver and gold are tables in the warehouse file.
+
+![Data structure](diagrams/data_structure.png)
+
+| Layer | Plain English | What it is here | Where it lives |
+|-------|---------------|-----------------|----------------|
+| **Bronze** | Save what the city gave us | Exact TLC Parquet rows + `_source_file`, `_ingested_at`, `_run_id`. **No cleaning.** | `data/bronze/` on disk |
+| **Silver** | Keep only valid trips | Renamed columns, derived `trip_duration_minutes`, date parts, partition `year`/`month` | `silver_trips` |
+| **Gold** | Analytics layout for SQL/BI | **Star schema:** `fact_rides` (facts) + `dim_date`, `dim_location` (dimensions) | `fact_rides`, `dim_*` |
+| **Quarantine** | Park bad rows | Rows that failed silver cleaning rules | `rejects_quarantine` |
+| **Run history** | Audit trail per run | Row counts, status, validation JSON | `pipeline_runs`, `logs/` |
+
+### Data inputs
+
+**Yellow taxi** trips — TLC publishes separate files per fleet type; this project uses yellow cabs (`yellow_tripdata_*.parquet`; `taxi_type = "yellow"` in config). **Parquet** — TLC's monthly columnar file format.
+
+Two inputs from [NYC TLC Trip Record Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) (download URLs in `config.toml`):
+
+| Source | File | Role |
+|--------|------|------|
+| TLC trip Parquet | `data/bronze/trips/year=YYYY/month=MM/yellow_tripdata_YYYY-MM.parquet` | Bronze — one row per trip |
+| Zone lookup CSV | `data/bronze/reference/taxi_zone_lookup.csv` | Reference — builds gold `dim_location` (~265 zones) |
+
+```text
+Trip row:  PULocationID = 161, DOLocationID = 229   (just numbers)
+Zone CSV:  161 → Manhattan / Midtown Center
+           229 → Queens / LaGuardia Airport
+```
+
+Column definitions: [Technical reference](#technical-reference) below.
+
+---
+
+## Pipeline workflow
+
+Step order inside one `run_partition()` call — see [Data structure](#data-structure) for layers and tables. One partition (`year` + `month`).
+
+![Pipeline workflow](diagrams/pipeline_workflow.png)
+
+| Step | What happens | Code / output |
+|------|----------------|---------------|
+| 1 | Download TLC trip Parquet (+ zone CSV once) | `ingest.py` → `data/bronze/` |
+| 2 | Land bronze — raw trips + ingest metadata | Parquet on disk |
+| 3 | Silver — keep valid rows, quarantine bad rows | `transform.build_silver` → `silver_trips`, `rejects_quarantine` |
+| 4 | Validate silver — row count, null checks | `validate.py` — fail stops pipeline |
+| 5 | Gold — **star schema** (`fact_rides` + `dim_date` + `dim_location`) | `transform.build_gold` → `fact_rides`, `dim_*` |
+| 6 | Validate gold — row count, location **foreign keys** (FKs) | `validate.py` |
+| 7 | Audit — log counts, status, validation results | `pipeline_runs` + `logs/` |
+
+| Module | Role |
+|--------|------|
+| `ingest.py` | `prepare_bronze`, downloads |
+| `transform.py` | `build_silver`, `build_gold` |
+| `transform_sql.py` | SQL fragments by `warehouse.dialect` |
+| `validate.py` | `validate_silver`, `validate_gold` |
+| `warehouses/` | `make_warehouse`, `create_tables`, `execute` |
+| `schema.py` | `ddl_sqlite()`, `ddl_duckdb()` |
+
+**`run_partition()` steps:**
+
+1. `setup_logging`
+2. `make_warehouse` · `create_tables` · `insert_pipeline_run`
+3. `prepare_bronze`
+4. `build_silver`
+5. `validate_silver`
+6. `build_gold`
+7. `validate_gold`
+8. `update_pipeline_run` + `validation_json`
+
+---
+
+## Validation gates
+
+Answers the problem's **no quality gate** item. Two mechanisms — do not confuse them:
+
+1. **Per-row cleaning** (`build_silver`) — reject bad trips to quarantine; run continues.
+2. **Partition gates** (`validate.py`) — check the whole year/month; fail stops or marks the run failed.
+
+![Validation gates](diagrams/validation_gates.png)
+
+### Row cleaning (inside `build_silver`)
+
+**Not** `validate.py`. Per row via `transform_sql.valid_where(dialect)`.
+
+| Rule | Fails when |
+|------|------------|
+| Pickup exists | `tpep_pickup_datetime` is null |
+| Dropoff exists | `tpep_dropoff_datetime` is null |
+| Pickup zone valid | `PULocationID` null or ≤ 0 |
+| Fare non-negative | `fare_amount` null or < 0 |
+| Distance non-negative | `trip_distance` null or < 0 |
+| Time order | dropoff before pickup |
+
+Failed row → `rejects_quarantine`. Run continues.
+
+### Partition checks (`validate.py`)
+
+| When | Function | On failure |
+|------|----------|------------|
+| After silver, before gold | `validate_silver` | Run stops; gold not built |
+| After gold | `validate_gold` | Run `failed`; `validation_json` saved |
+
+**`validate_silver`:**
+
+| Check | Rule | Config key |
+|-------|------|------------|
+| `silver_min_rows` | `silver_trips` count for partition ≥ threshold | `min_rows_per_month` (default 1000) |
+| `silver_null_pickup_pct` | % of silver rows with null `tpep_pickup_datetime` ≤ threshold | `max_null_pickup_pct` (default 0.01) |
+
+**`validate_gold`:**
+
+| Check | Rule | Config key |
+|-------|------|------------|
+| `gold_min_rows` | `fact_rides` count for partition ≥ threshold | `min_rows_per_month` |
+| `gold_location_fks` | No **orphan foreign keys** — every `pickup_location_id` / `dropoff_location_id` in `fact_rides` must exist in `dim_location` | (no config — must be 0) |
+
+```toml
+[validation]
+max_null_pickup_pct = 0.01
+min_rows_per_month = 1000
+```
+
+Pipeline order: `build_silver` → `validate_silver` → `build_gold` → `validate_gold`
+
+Walkthrough with example rows: [README — Example walkthrough](../README.md#example-walkthrough)
+
+---
+
+## Warehouse backend
+
+Where silver and gold tables are stored — one file per deployment, **SQLite** (`taxi.db`, default) or **DuckDB** (`taxi.duckdb`). Config picks the engine. The warehouse class is used in two ways:
+
+![Warehouse backend](diagrams/warehouse_backend.png)
+
+| Term | Where it lives | Meaning |
+|------|----------------|---------|
+| **backend** | `config.toml` → `AppConfig.warehouse_backend` | Which database engine: `sqlite` (default) or `duckdb` |
+| **dialect** | `warehouse.dialect` on each warehouse class | That engine's SQL syntax — `transform_sql.py` emits different SQL per dialect |
+
+```toml
+[warehouse]
+backend = "sqlite"   # sqlite | duckdb
+path = "warehouse/taxi.db"
+```
+
+```text
+config.toml [warehouse] backend
+    → load_config() → make_warehouse()
+        → SqliteWarehouse (dialect = "sqlite")  or  DuckdbWarehouse (dialect = "duckdb")
+```
+
+| | SQLite (default) | DuckDB (optional) |
+|--|------------------|-------------------|
+| **File** | `warehouse/taxi.db` | `warehouse/taxi.duckdb` |
+| **Dependency** | stdlib `sqlite3` | `duckdb` package |
+| **Tables** | Same names | Same logical schema |
+| **SQL in transforms** | `strftime`, `datetime`, `REAL` | `EXTRACT`, `datediff`, `DOUBLE`, `TIMESTAMP` |
+
+`make_warehouse(config)` → `SqliteWarehouse` or `DuckdbWarehouse` (both extend `BaseWarehouse`).
+
+| Path | When | What |
+|------|------|------|
+| **Create tables** | Pipeline start | `create_tables()` → `ddl_sqlite()` or `ddl_duckdb()` in `schema.py` |
+| **Transform SQL** | `build_silver` / `build_gold` | `transform.py` reads `warehouse.dialect` → `transform_sql.py` → `warehouse.execute()` |
+
+Table layout is in `schema.py`. Dialect differences are isolated in `transform_sql.py` — `transform.py` calls `silver_select(dialect)`, `valid_where(dialect)`, etc.
 
 ---
 
 ## Orchestration
 
-**Orchestration** = how a run starts and which code runs the steps. There is a single ETL implementation. Airflow does not import `taxi_etl`.
+How a run **starts** — separate from what the pipeline **does** to the data (after [Pipeline workflow](#pipeline-workflow) above). There is one ETL implementation; Airflow does not import `taxi_etl`.
 
 ![Orchestration workflow](diagrams/orchestration_workflow.png)
 
@@ -116,175 +302,9 @@ This sets `AIRFLOW_HOME=./airflow` and runs `airflow standalone` (scheduler + we
 
 ---
 
-## Pipeline workflow
-
-Linear Python module flow for one **partition** (one `year` + `month`). No factory packages beyond `warehouses/`.
-
-![Pipeline workflow](diagrams/pipeline_workflow.png)
-
-| Step | What happens | Code / output |
-|------|----------------|---------------|
-| 1 | Download TLC trip Parquet (+ zone CSV once) | `ingest.py` → `data/bronze/` |
-| 2 | Land bronze — raw trips + ingest metadata | Parquet on disk |
-| 3 | Silver — keep valid rows, quarantine bad rows | `transform.build_silver` → `silver_trips`, `rejects_quarantine` |
-| 4 | Validate silver — row count, null checks | `validate.py` — fail stops pipeline |
-| 5 | Gold — **star schema** (one fact table + dimension tables for date and location) | `transform.build_gold` → `fact_rides`, `dim_*` |
-| 6 | Validate gold — row count, location **foreign keys** (FKs) | `validate.py` |
-| 7 | Audit — log counts, status, validation results | `pipeline_runs` + `logs/` |
-
-| Module | Role |
-|--------|------|
-| `ingest.py` | `prepare_bronze`, downloads |
-| `transform.py` | `build_silver`, `build_gold` |
-| `transform_sql.py` | SQL fragments by `warehouse.dialect` |
-| `validate.py` | `validate_silver`, `validate_gold` |
-| `warehouses/` | `make_warehouse`, `create_tables`, `execute` |
-| `schema.py` | `ddl_sqlite()`, `ddl_duckdb()` |
-
-**`run_partition()` steps:**
-
-1. `setup_logging`
-2. `make_warehouse` · `create_tables` · `insert_pipeline_run`
-3. `prepare_bronze`
-4. `build_silver`
-5. `validate_silver`
-6. `build_gold`
-7. `validate_gold`
-8. `update_pipeline_run` + `validation_json`
-
----
-
-## Data structure
-
-**Medallion architecture** — data moves through bronze → silver → gold, gaining quality at each stage. **Star schema** (gold) — `fact_rides` (measures per trip) joined to `dim_date` (when) and `dim_location` (where). Bronze is on disk; silver/gold live in the warehouse file.
-
-![Data structure](diagrams/data_structure.png)
-
-| Layer | Plain English | What it is here | Where it lives |
-|-------|---------------|-----------------|----------------|
-| **Bronze** | Save what the city gave us | Exact TLC Parquet rows + `_source_file`, `_ingested_at`, `_run_id`. **No cleaning.** | `data/bronze/` on disk |
-| **Silver** | Keep only valid trips | Renamed columns, derived `trip_duration_minutes`, date parts, partition `year`/`month` | `silver_trips` |
-| **Gold** | Shape for reports and SQL | Star schema: `fact_rides` + `dim_date` + `dim_location` | `fact_rides`, `dim_*` |
-| **Quarantine** | Park bad rows | Rows that failed silver rules | `rejects_quarantine` |
-| **Run history** | Audit | Row counts, status, validation JSON | `pipeline_runs`, `logs/` |
-
-**Star schema (gold):** `fact_rides` (one row per trip, numeric measures) joined to `dim_date` (calendar/time attributes) and `dim_location` (borough/zone names) — the layout most BI tools and report SQL expect.
-
-### Data inputs
-
-Two files from [NYC TLC Trip Record Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) (URLs in `config.toml`):
-
-| Source | File | Role |
-|--------|------|------|
-| TLC trip Parquet | `data/bronze/trips/year=YYYY/month=MM/yellow_tripdata_YYYY-MM.parquet` | Bronze — one row per trip |
-| Zone lookup CSV | `data/bronze/reference/taxi_zone_lookup.csv` | Reference — builds gold `dim_location` (~265 zones) |
-
-```text
-Trip row:  PULocationID = 161, DOLocationID = 229   (just numbers)
-Zone CSV:  161 → Manhattan / Midtown Center
-           229 → Queens / LaGuardia Airport
-```
-
-Column definitions: [Technical reference](#technical-reference) below.
-
----
-
-## Validation gates
-
-**Validation gates** are whole-**partition** checks (one year/month) that stop or fail the run — separate from **per-row cleaning** during `build_silver` (bad rows quarantined; run continues).
-
-![Validation gates](diagrams/validation_gates.png)
-
-### Row cleaning (inside `build_silver`)
-
-**Not** `validate.py`. Per row via `transform_sql.valid_where(dialect)`.
-
-| Rule | Fails when |
-|------|------------|
-| Pickup exists | `tpep_pickup_datetime` is null |
-| Dropoff exists | `tpep_dropoff_datetime` is null |
-| Pickup zone valid | `PULocationID` null or ≤ 0 |
-| Fare non-negative | `fare_amount` null or < 0 |
-| Distance non-negative | `trip_distance` null or < 0 |
-| Time order | dropoff before pickup |
-
-Failed row → `rejects_quarantine`. Run continues.
-
-### Partition checks (`validate.py`)
-
-| When | Function | On failure |
-|------|----------|------------|
-| After silver, before gold | `validate_silver` | Run stops; gold not built |
-| After gold | `validate_gold` | Run `failed`; `validation_json` saved |
-
-**`validate_silver`:**
-
-| Check | Rule | Config key |
-|-------|------|------------|
-| `silver_min_rows` | `silver_trips` count for partition ≥ threshold | `min_rows_per_month` (default 1000) |
-| `silver_null_pickup_pct` | % of silver rows with null `tpep_pickup_datetime` ≤ threshold | `max_null_pickup_pct` (default 0.01) |
-
-**`validate_gold`:**
-
-| Check | Rule | Config key |
-|-------|------|------------|
-| `gold_min_rows` | `fact_rides` count for partition ≥ threshold | `min_rows_per_month` |
-| `gold_location_fks` | No **orphan foreign keys** — every `pickup_location_id` / `dropoff_location_id` in `fact_rides` must exist in `dim_location` | (no config — must be 0) |
-
-```toml
-[validation]
-max_null_pickup_pct = 0.01
-min_rows_per_month = 1000
-```
-
-Pipeline order: `build_silver` → `validate_silver` → `build_gold` → `validate_gold`
-
-Walkthrough with example rows: [README — Example walkthrough](../README.md#example-walkthrough)
-
----
-
-## Warehouse backend
-
-The **warehouse** is where silver and gold tables live — a single file, SQLite (`taxi.db`) or DuckDB (`taxi.duckdb`). Config picks the engine. Two separate uses of the warehouse class:
-
-![Warehouse backend](diagrams/warehouse_backend.png)
-
-| Term | Where it lives | Meaning |
-|------|----------------|---------|
-| **backend** | `config.toml` → `AppConfig.warehouse_backend` | Which database engine: `sqlite` (default) or `duckdb` |
-| **dialect** | `warehouse.dialect` on each warehouse class | That engine's SQL syntax — `transform_sql.py` emits different SQL per dialect |
-
-```toml
-[warehouse]
-backend = "sqlite"   # sqlite | duckdb
-path = "warehouse/taxi.db"
-```
-
-```text
-config.toml [warehouse] backend
-    → load_config() → make_warehouse()
-        → SqliteWarehouse (dialect = "sqlite")  or  DuckdbWarehouse (dialect = "duckdb")
-```
-
-| | SQLite (default) | DuckDB (optional) |
-|--|------------------|-------------------|
-| **File** | `warehouse/taxi.db` | `warehouse/taxi.duckdb` |
-| **Dependency** | stdlib `sqlite3` | `duckdb` package |
-| **Tables** | Same names | Same logical schema |
-| **SQL in transforms** | `strftime`, `datetime`, `REAL` | `EXTRACT`, `datediff`, `DOUBLE`, `TIMESTAMP` |
-
-`make_warehouse(config)` → `SqliteWarehouse` or `DuckdbWarehouse` (both extend `BaseWarehouse`).
-
-| Path | When | What |
-|------|------|------|
-| **Create tables** | Pipeline start | `create_tables()` → `ddl_sqlite()` or `ddl_duckdb()` in `schema.py` |
-| **Transform SQL** | `build_silver` / `build_gold` | `transform.py` reads `warehouse.dialect` → `transform_sql.py` → `warehouse.execute()` |
-
-Table layout is in `schema.py`. Dialect differences are isolated in `transform_sql.py` — `transform.py` calls `silver_select(dialect)`, `valid_where(dialect)`, etc.
-
----
-
 ## Technical reference
+
+Column-level detail for TLC source files and warehouse tables. Skim after the sections above if you need field meanings.
 
 ### TLC trip Parquet — columns
 
@@ -511,7 +531,7 @@ nyc-taxi-etl/
 
 ### Optional later
 
-- **Streamlit** dashboard (`dashboard/streamlit_app.py`)
+- **Streamlit** — optional read-only dashboard (`dashboard/streamlit_app.py`)
 - **Airflow + `dags/`** — optional scheduler; one DAG subprocesses `run_pipeline.py`
 
 ---
@@ -520,4 +540,4 @@ nyc-taxi-etl/
 
 | Doc | Contents |
 |-----|----------|
-| [`../README.md`](../README.md) | Quick start, example walkthrough |
+| [`../README.md`](../README.md) | Problem, example walkthrough, quick start |
